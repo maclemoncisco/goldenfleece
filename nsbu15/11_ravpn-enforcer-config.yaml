@@ -1,0 +1,292 @@
+apiVersion: cnfw.cisco.com/v1
+kind: ASAConfiguration
+metadata:
+  name: ravpn-enforcer-config
+  namespace: sfcn-system
+  labels:
+    sfcn.cisco.com/service-role: "default"
+spec:
+  order: 1
+  description: "RA-VPN Configuration"
+  fileObjects:
+    - "ravpnprofile"
+    - "anyconnectrdpprofile"
+    - "anyconnectlinux"
+    - "anyconnectwin"
+    - "anyconnectmac"
+    - "umbrellaorginfo"
+  ipv4SubnetPools:
+    - "ravpnpool"
+  secrets:
+    - "mypkcs"
+    - "redisca"
+    - "userinfo"
+    - "digicerthigh"
+    - "digicertsha2"
+    - "samlcert"
+    - "adsvcacct"
+    - "sfcn-redis"
+  cliLines: |
+    interface Management0/0
+     no management-only
+     nameif management
+     security-level 0
+     ip address dhcp
+    interface TenGigabitEthernet0/0
+     nameif outside
+     security-level 0
+     ip address dhcp
+    interface TenGigabitEthernet0/1
+     nameif inside
+     security-level 100
+     ip address dhcp
+    #Uncomment to force a delta merge failure
+    #object net net16
+    #host 8.8.8.16
+    same-security-traffic permit inter-interface
+    same-security-traffic permit intra-interface
+    #Configure route to internet over outside interface
+    route outside 0 0 {{ index .nodeLabels "sfcn.cisco.com.interface.2/gateway-ipv4" }} 1
+    #Configure route to vpc addresses over inside interface
+    route inside 10.37.0.0 255.255.0.0 {{ index .nodeLabels "sfcn.cisco.com.interface.3/gateway-ipv4" }} 2
+    route inside 10.0.124.0 255.255.255.0 {{ index .nodeLabels "sfcn.cisco.com.interface.3/gateway-ipv4" }} 2
+    route inside 10.0.122.0 255.255.255.0 {{ index .nodeLabels "sfcn.cisco.com.interface.3/gateway-ipv4" }} 2
+    route inside 10.0.123.0 255.255.255.0 {{ index .nodeLabels "sfcn.cisco.com.interface.3/gateway-ipv4" }} 2
+    #Add an explicit route to Redis server IP address over outside interface
+    route outside 10.37.54.199 255.255.255.255 {{ index .nodeLabels "sfcn.cisco.com.interface.2/gateway-ipv4" }}
+    #Add the following DNS configuration to have ASA contact R53 for DNS lookup
+    dns domain-lookup outside
+    dns server-group DefaultDNS
+    #published AWS DNS server
+    name-server 169.254.169.253
+    # Configure the IP address pool from where the clients will receive an IP address
+    ip local pool VPN_AC_pool {{.ipv4SubnetPools.ravpnpool.assignedRange}} mask {{.ipv4SubnetPools.ravpnpool.subnetMask}}
+    #Define access lists as required.
+    #access-list <ACL name> standard <permit/deny> <subnet> <netmask>
+    #access-list for optional split tunnel access to AWS VPC
+    access-list Split_Tunnel_ACL extended permit ip 10.37.0.0 255.255.0.0 any4
+    access-list Split_Tunnel_ACL extended permit ip 10.0.124.0 255.255.255.0 any4
+    access-list Split_Tunnel_ACL extended permit ip 10.0.122.0 255.255.255.0 any4
+    access-list 101 extended permit ip any4 any4
+    access-group 101 in interface outside
+    access-group 101 in interface inside
+    aaa-server DUO-LDAPS protocol ldap
+    aaa-server DUO-LDAPS (outside) host api-65678fac.duosecurity.com
+     timeout 60
+     server-port 636
+     ldap-base-dn dc=DICXUIF3IB9A5QRFO61C,dc=duosecurity,dc=com
+     ldap-naming-attribute cn
+     ldap-login-password mVhhYfi3xMe1njFskzaNWZ0zn18bwOII9EvLjLuh
+     ldap-login-dn dc=DICXUIF3IB9A5QRFO61C,dc=duosecurity,dc=com
+     ldap-over-ssl enable
+     server-type auto-detect
+    aaa-server AD protocol ldap
+    aaa-server AD (inside) host 10.0.124.5
+     timeout 5
+     ldap-base-dn dc=nsbutesting,dc=local
+     ldap-scope subtree
+     ldap-naming-attribute sAMAccountName
+     ldap-login-password {{ .secrets.adsvcacct.passwd }}
+     ldap-login-dn cn=acldapsvc,ou=serviceaccounts,dc=nsbutesting,dc=local
+     server-type microsoft
+    webvpn
+     enable outside
+     default-idle-timeout 86400
+     anyconnect profiles my_AC_profile {{ .fileObjects.ravpnprofile.path }}
+     anyconnect profiles RDP_profile {{ .fileObjects.anyconnectrdpprofile.path }}
+     anyconnect profiles orginfo {{ .fileObjects.umbrellaorginfo.path }}
+     anyconnect image {{ .fileObjects.anyconnectwin.path }} 1
+     anyconnect image {{ .fileObjects.anyconnectmac.path }} 2
+     anyconnect image {{ .fileObjects.anyconnectlinux.path }} 3
+     anyconnect enable
+     tunnel-group-list enable
+     username {{ .secrets.userinfo.username }} password {{ .secrets.userinfo.password }} privilege {{ .secrets.userinfo.privilege }}
+    #Configure Redis server IP and enable external database.
+    external-database
+     host {{ index .secrets "sfcn-redis" "host" }}
+     #host	master.machamrznqbqeev.h5wuke.use1.cache.amazonaws.com
+     port 6379
+     enable
+    vpn load-balancing
+     external-database
+    #Any priority value other than 10 designates the ASAc
+    #as a member.
+    #MC Added redirect-fqdn enable
+     redirect-fqdn enable
+     priority 1
+     interface lbpublic outside
+    #We add the public IP of the "outside" interface for NAT command
+    #The interface indices for "management", "outside" and "inside" interfaces
+    #are 1, 2 and 3 respectively.
+    nat {{ index .nodeLabels "sfcn.cisco.com.interface.2/public-ip" }}
+    vpn-sessiondb external-database
+    #MC Added domain-name     domain-name maclemon-dev-builds.csmralabs.net
+    domain-name nsbu15.nsbutesting.com
+    #Configure the Redis CA certificate
+    crypto ca trustpoint {{ .secrets.redisca.trustpoint }}
+     enrollment terminal
+    crypto ca authenticate {{ .secrets.redisca.trustpoint }} nointeractive
+    {{ .secrets.redisca.value }}
+    quit
+    #Import PKCS12 certificate for SSL connection
+    crypto ca import {{ .secrets.mypkcs.trustpoint }} pkcs12 {{ .secrets.mypkcs.password }} nointeractive
+    {{ .secrets.mypkcs.value }}
+    quit
+    ssl trust-point {{ .secrets.mypkcs.trustpoint }}
+    #Configure the Duo DigiCert High certificate
+    crypto ca trustpoint {{ .secrets.digicerthigh.trustpoint }}
+     enrollment terminal
+    crypto ca authenticate {{ .secrets.digicerthigh.trustpoint }} nointeractive
+    {{ .secrets.digicerthigh.value }}
+    quit
+    #Configure the Digicert SHA2 certificate
+    crypto ca trustpoint {{ .secrets.digicertsha2.trustpoint }}
+     enrollment terminal
+    crypto ca authenticate {{ .secrets.digicertsha2.trustpoint }} nointeractive
+    {{ .secrets.digicertsha2.value }}
+    quit
+    #Configure the SAML certificate
+    crypto ca trustpoint {{ .secrets.samlcert.trustpoint }}
+     enrollment terminal
+    crypto ca authenticate {{ .secrets.samlcert.trustpoint }} nointeractive
+    {{ .secrets.samlcert.value }}
+    quit
+    policy-map global_policy
+     class inspection_default
+      inspect icmp
+    #Default VPN Group Policy
+    group-policy DfltGrpPolicy attributes
+     banner value Welcome to the SFCN Lab
+     banner value
+     banner value This stack is for internal testing only
+     banner value
+     banner value Contact cmra-dev-test@cisco.com for more information
+     vpn-simultaneous-logins 10000
+     vpn-idle-timeout none
+     vpn-tunnel-protocol ikev1 ikev2 l2tp-ipsec ssl-client ssl-clientless
+     split-tunnel-policy tunnelspecified
+     split-tunnel-network-list value Split_Tunnel_ACL
+     webvpn
+      anyconnect dtls compression lzs
+      anyconnect modules value umbrella
+      anyconnect profiles value orginfo type umbrella
+    #Configure AD Auth Group Policy
+    group-policy GroupPolicy_AD-AUTH internal
+    group-policy GroupPolicy_AD-AUTH attributes
+     wins-server none
+     dns-server value 208.67.222.222 10.0.124.5
+     vpn-tunnel-protocol ssl-client
+     split-tunnel-policy tunnelspecified
+     split-tunnel-network-list value Split_Tunnel_ACL
+     default-domain value nsbutesting.local
+     webvpn
+      anyconnect dtls compression lzs
+      anyconnect modules value umbrella
+      anyconnect profiles value orginfo type umbrella
+    #Configure DUO LDAPS Group Policy
+    group-policy GroupPolicy_DUO-LDAPS internal
+    group-policy GroupPolicy_DUO-LDAPS attributes
+     wins-server none
+     dns-server value 208.67.222.222 10.0.124.5
+     vpn-tunnel-protocol ssl-client
+     split-tunnel-policy tunnelspecified
+     split-tunnel-network-list value Split_Tunnel_ACL
+     default-domain value nsbutesting.local
+     webvpn
+      anyconnect dtls compression lzs
+      anyconnect modules value umbrella
+      anyconnect profiles value orginfo type umbrella
+    #Configure LOCAL Auth Group Policy
+    group-policy GroupPolicy_LOCAL-AUTH internal
+    group-policy GroupPolicy_LOCAL-AUTH attributes
+     wins-server none
+     dns-server value 208.67.222.222 10.0.124.5
+     vpn-tunnel-protocol ssl-client
+     split-tunnel-policy tunnelspecified
+     split-tunnel-network-list value Split_Tunnel_ACL
+     default-domain value sfcn.local
+     webvpn
+      anyconnect dtls compression lzs
+      anyconnect modules value umbrella
+      anyconnect profiles value orginfo type umbrella
+    #Configure Duo LDAPS Tunnel Group
+    tunnel-group DUO-LDAPS type remote-access
+    tunnel-group DUO-LDAPS general-attributes
+     address-pool VPN_AC_pool
+     authentication-server-group AD
+     secondary-authentication-server-group DUO-LDAPS use-primary-username
+     #default-group-policy GroupPolicy_DUO-LDAPS
+    tunnel-group DUO-LDAPS webvpn-attributes
+     customization DUO-LDAPS
+     group-alias DUO-LDAPS enable
+    #Configure AD Auth Tunnel Group
+    tunnel-group AD-AUTH type remote-access
+    tunnel-group AD-AUTH general-attributes
+     address-pool VPN_AC_pool
+     authentication-server-group AD
+     default-group-policy GroupPolicy_AD-AUTH
+    tunnel-group AD-AUTH webvpn-attributes
+     group-alias AD-AUTH enable
+    #Configure LOCAL Auth Tunnel Group
+    tunnel-group LOCAL-AUTH type remote-access
+    tunnel-group LOCAL-AUTH general-attributes
+     address-pool VPN_AC_pool
+     default-group-policy GroupPolicy_LOCAL-AUTH
+    tunnel-group LOCAL-AUTH webvpn-attributes
+     group-alias LOCAL-AUTH enable
+
+---
+
+apiVersion: cnfw.cisco.com/v1
+kind: ASAConfiguration
+metadata:
+  name: ravpn-enforcer-saml-config
+  namespace: sfcn-system
+  labels:
+    sfcn.cisco.com/service-role: "default"
+spec:
+  order: 2
+  description: "SAML Configuration"
+  secrets:
+    - "mypkcs"
+    - "samlcert"
+  cliLines: |
+    webvpn
+     saml idp https://sso-65678fac.sso.duosecurity.com/saml2/sp/DISFE10LWRWKBENV2O1X/metadata
+     url sign-in https://sso-65678fac.sso.duosecurity.com/saml2/sp/DISFE10LWRWKBENV2O1X/sso
+     url sign-out https://sso-65678fac.sso.duosecurity.com/saml2/sp/DISFE10LWRWKBENV2O1X/slo
+     base-url https://nsbu15.nsbutesting.com
+     trustpoint idp {{ .secrets.samlcert.trustpoint }}
+     trustpoint sp {{ .secrets.mypkcs.trustpoint }}
+     no signature
+     force re-authentication
+     timeout assertion 7200
+    group-policy VPN_group_policy internal
+    group-policy VPN_group_policy attributes
+     banner value Welcome to the SFCN Lab
+     banner value
+     banner value This stack is for internal testing only
+     banner value
+     banner value Contact cmra-dev-test@cisco.com for more information
+     vpn-simultaneous-logins 10000
+     vpn-idle-timeout none
+      vpn-tunnel-protocol ssl-client
+      #Enable split tunnel if required.
+     vpn-tunnel-protocol ikev1 ikev2 l2tp-ipsec ssl-client ssl-clientless
+      #Example:
+      split-tunnel-policy tunnelspecified
+      split-tunnel-network-list value Split_Tunnel_ACL
+      webvpn
+        anyconnect profiles value my_AC_profile type user
+        anyconnect profiles value RDP_profile type user
+        anyconnect modules value umbrella
+        anyconnect profiles value orginfo type umbrella
+        anyconnect dtls compression lzs
+    tunnel-group VPN_tunnel_group type remote-access
+    tunnel-group VPN_tunnel_group general-attributes
+     address-pool VPN_AC_pool
+     default-group-policy VPN_group_policy
+    tunnel-group VPN_tunnel_group webvpn-attributes
+     group-alias VPN_tunnel_group enable
+    authentication saml
+    saml identity-provider https://sso-65678fac.sso.duosecurity.com/saml2/sp/DISFE10LWRWKBENV2O1X/metadata
